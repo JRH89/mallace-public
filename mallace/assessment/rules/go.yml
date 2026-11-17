@@ -1,0 +1,203 @@
+# Go taint rules: caller-controlled data (function parameters, HTTP request data, os.Args,
+# environment, stdin) must reach the sink. Constant-only queries and commands are not reported.
+rules:
+  - id: mallace.go.command-injection
+    languages: [go]
+    severity: WARNING
+    message: Caller-controlled data reaches a shell command.
+    mode: taint
+    pattern-sources: &input
+      - patterns:
+          - pattern-inside: |
+              func $FUNC(..., $PARAM $TYPE, ...) $RET { ... }
+          - pattern: $PARAM
+      - patterns:
+          - pattern-inside: |
+              func $FUNC(..., $PARAM $TYPE, ...) { ... }
+          - pattern: $PARAM
+      - patterns:
+          - pattern-inside: |
+              func ($R $RT) $FUNC(..., $PARAM $TYPE, ...) $RET { ... }
+          - pattern: $PARAM
+      - patterns:
+          - pattern-inside: |
+              func ($R $RT) $FUNC(..., $PARAM $TYPE, ...) { ... }
+          - pattern: $PARAM
+      - pattern-either:
+          - pattern: os.Args
+          - pattern: os.Getenv(...)
+          - pattern: (*http.Request).$ANY
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.URL.Query()
+    pattern-sanitizers:
+      - pattern: strconv.Atoi(...)
+      - pattern: strconv.ParseInt(...)
+      - pattern: strconv.Itoa(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: exec.Command("sh", "-c", $CMD, ...)
+              - pattern: exec.Command("bash", "-c", $CMD, ...)
+              - pattern: exec.Command("/bin/sh", "-c", $CMD, ...)
+              - pattern: exec.Command("/bin/bash", "-c", $CMD, ...)
+              - pattern: exec.CommandContext($CTX, "sh", "-c", $CMD, ...)
+              - pattern: exec.CommandContext($CTX, "bash", "-c", $CMD, ...)
+              - pattern: exec.CommandContext($CTX, "/bin/sh", "-c", $CMD, ...)
+              - pattern: exec.Command($CMD)
+              - pattern: exec.Command($CMD, ...)
+              - pattern: syscall.Exec($CMD, ...)
+          - focus-metavariable: $CMD
+  - id: mallace.go.sql-query-construction
+    languages: [go]
+    severity: WARNING
+    message: SQL query is built from caller-controlled data instead of bound parameters.
+    mode: taint
+    pattern-sources:
+      - label: INPUT
+        patterns:
+          - pattern-inside: |
+              func $FUNC(..., $PARAM $TYPE, ...) $RET { ... }
+          - pattern: $PARAM
+      - label: INPUT
+        patterns:
+          - pattern-inside: |
+              func $FUNC(..., $PARAM $TYPE, ...) { ... }
+          - pattern: $PARAM
+      - label: INPUT
+        patterns:
+          - pattern-inside: |
+              func ($R $RT) $FUNC(..., $PARAM $TYPE, ...) $RET { ... }
+          - pattern: $PARAM
+      - label: INPUT
+        patterns:
+          - pattern-inside: |
+              func ($R $RT) $FUNC(..., $PARAM $TYPE, ...) { ... }
+          - pattern: $PARAM
+      - label: INPUT
+        pattern-either:
+          - pattern: os.Args
+          - pattern: os.Getenv(...)
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.URL.Query()
+      - label: BUILT
+        requires: INPUT
+        pattern-either:
+          - pattern: $LEFT + $RIGHT
+          - pattern: fmt.Sprintf(...)
+          - pattern: strings.Join(...)
+          - pattern: strings.Replace(...)
+          - pattern: strings.ReplaceAll(...)
+    pattern-sanitizers:
+      - pattern: strconv.Atoi(...)
+      - pattern: strconv.ParseInt(...)
+      - pattern: strconv.Itoa(...)
+      - pattern: strconv.FormatInt(...)
+    pattern-sinks:
+      - requires: BUILT
+        patterns:
+          - pattern-either:
+              - pattern: $DB.Query($QUERY, ...)
+              - pattern: $DB.QueryContext($CTX, $QUERY, ...)
+              - pattern: $DB.QueryRow($QUERY, ...)
+              - pattern: $DB.QueryRowContext($CTX, $QUERY, ...)
+              - pattern: $DB.Exec($QUERY, ...)
+              - pattern: $DB.ExecContext($CTX, $QUERY, ...)
+              - pattern: $DB.Prepare($QUERY)
+              - pattern: $DB.PrepareContext($CTX, $QUERY)
+              - pattern: $DB.Raw($QUERY, ...)
+              - pattern: $DB.Select($DEST, $QUERY, ...)
+              - pattern: $DB.Get($DEST, $QUERY, ...)
+              - pattern: $DB.Queryx($QUERY, ...)
+              - pattern: $DB.QueryRowx($QUERY, ...)
+              - pattern: $DB.MustExec($QUERY, ...)
+          - focus-metavariable: $QUERY
+  - id: mallace.go.template-injection
+    languages: [go]
+    severity: WARNING
+    message: Caller-controlled data is parsed as a template, which can run template actions.
+    mode: taint
+    pattern-sources: *input
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $T.Parse($TEXT)
+              - pattern: template.Must($T.Parse($TEXT))
+          - focus-metavariable: $TEXT
+  # XSS, stored XSS and file reads only follow web request data (not plain function parameters).
+  - id: mallace.go.reflected-xss
+    languages: [go]
+    severity: WARNING
+    message: Request data is written as HTML without escaping (cross-site scripting).
+    mode: taint
+    pattern-sources: &web
+      - pattern-either:
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.PostFormValue(...)
+          - pattern: $REQ.URL.Query()
+          - pattern: $REQ.URL.Path
+          - pattern: $REQ.URL.RawQuery
+          - pattern: $REQ.PathValue(...)
+          - pattern: $REQ.Header.Get(...)
+          - pattern: $REQ.Form
+          - pattern: $REQ.PostForm
+          - pattern: $REQ.Body
+          - pattern: $REQ.Cookie(...)
+    pattern-sanitizers: &xss_clean
+      - pattern-either:
+          - pattern: html.EscapeString(...)
+          - pattern: template.HTMLEscapeString(...)
+          - pattern: template.JSEscapeString(...)
+          - pattern: url.QueryEscape(...)
+          - pattern: url.PathEscape(...)
+          - pattern: strconv.Atoi(...)
+          - pattern: strconv.ParseInt(...)
+          - pattern: json.Marshal(...)
+          # Reported as path traversal, not again as XSS.
+          - pattern: os.ReadFile(...)
+          - pattern: ioutil.ReadFile(...)
+    pattern-sinks: &xss_out
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: fmt.Fprintf($W, $OUT, ...)
+                      - pattern: fmt.Fprintf($W, $FMT, ..., $OUT, ...)
+                      - pattern: fmt.Fprint($W, ..., $OUT, ...)
+                      - pattern: fmt.Fprintln($W, ..., $OUT, ...)
+                      - pattern: io.WriteString($W, $OUT)
+                      - pattern: $W.Write($OUT)
+                  - metavariable-regex: {metavariable: $W, regex: '^(w|rw|wr|res|resp|response|writer|out)$'}
+              - pattern: template.HTML($OUT)
+          - focus-metavariable: $OUT
+  - id: mallace.go.stored-xss
+    languages: [go]
+    severity: WARNING
+    message: A value read from the database is written as HTML without escaping (stored cross-site scripting).
+    mode: taint
+    pattern-sources:
+      - by-side-effect: true
+        patterns:
+          - pattern: $ROWS.Scan(..., &$VALUE, ...)
+          - focus-metavariable: $VALUE
+    pattern-sanitizers: *xss_clean
+    pattern-sinks: *xss_out
+  - id: mallace.go.path-traversal
+    languages: [go]
+    severity: WARNING
+    message: A file path taken from the request is opened without confining it to a directory (path traversal).
+    mode: taint
+    pattern-sources: *web
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: filepath.Base(...)
+          - pattern: path.Base(...)
+          - pattern: strconv.Atoi(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: os.ReadFile($PATH)
+              - pattern: ioutil.ReadFile($PATH)
+              - pattern: os.Open($PATH)
+              - pattern: os.OpenFile($PATH, ...)
+              - pattern: http.ServeFile($W, $R, $PATH)
+          - focus-metavariable: $PATH

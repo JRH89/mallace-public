@@ -1,0 +1,373 @@
+# Taint rules: a finding needs caller-controlled data (a function argument other than self/cls,
+# argv, environment, stdin or a web request) to reach the sink. Constant-only queries and
+# commands are not reported. Labels let SQL wrappers that pass a query through stay quiet while
+# queries *built* from caller data are reported.
+rules:
+  - id: mallace.python.dynamic-eval
+    languages: [python]
+    severity: WARNING
+    message: Caller-controlled data reaches eval.
+    mode: taint
+    options: {taint_assume_safe_numbers: true, taint_assume_safe_booleans: true}
+    pattern-propagators: &comprehension
+      - pattern: "$TO = {$K: $V for $A, $B in $FROM}"
+        from: $FROM
+        to: $TO
+      # Parameter dicts built from matches over the query string: dict((m.group(1), ...) for m in re.finditer(..., query)).
+      - pattern: $TO = dict(<... $FROM ...>)
+        from: $FROM
+        to: $TO
+    pattern-sources: &input
+      - patterns:
+          - pattern-inside: |
+              def $FUNC(..., $PARAM, ...):
+                ...
+          - pattern: $PARAM
+          - metavariable-regex: {metavariable: $PARAM, regex: '^(?!(self|cls)$)'}
+      - pattern-either:
+          - pattern: input(...)
+          - pattern: sys.argv
+          - pattern: sys.stdin.$READ(...)
+          - pattern: os.environ[...]
+          - pattern: os.environ.get(...)
+          - pattern: os.getenv(...)
+          - pattern: request.$ATTR
+          - pattern: self.request.$ATTR
+      # Standard-library http.server handlers: the request line, headers and body.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-inside: |
+                      class $HANDLER(..., $BASE, ...):
+                        ...
+                  - metavariable-regex: {metavariable: $BASE, regex: '(^|\.)(Base|SimpleHTTP|CGIHTTP)?(HTTP)?RequestHandler$|(^|\.)StreamRequestHandler$'}
+              # Written out with the module name (class H(http.server.BaseHTTPRequestHandler)).
+              - pattern-inside: |
+                  class $HANDLER(..., http.server.$CLS, ...):
+                    ...
+              - pattern-inside: |
+                  class $HANDLER(..., socketserver.StreamRequestHandler, ...):
+                    ...
+          - pattern-either:
+              - pattern: self.path
+              - pattern: self.headers
+              - pattern: self.rfile.$READ(...)
+              - pattern: self.requestline
+      # A handler's own helper that returns request data (e.g. a parsed form body).
+      - patterns:
+          - pattern-inside: |
+              class $HANDLER(...):
+                ...
+                def $HELPER(self, ...):
+                  ...
+                  return <... self.rfile.$READ(...) ...>
+                ...
+          - pattern: self.$HELPER(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: eval($CODE, ...)
+          - focus-metavariable: $CODE
+  - id: mallace.python.dynamic-exec
+    languages: [python]
+    severity: WARNING
+    message: Caller-controlled data reaches exec.
+    mode: taint
+    options: {taint_assume_safe_numbers: true, taint_assume_safe_booleans: true}
+    pattern-propagators: *comprehension
+    pattern-sources: *input
+    pattern-sinks:
+      - patterns:
+          - pattern: exec($CODE, ...)
+          - focus-metavariable: $CODE
+  - id: mallace.python.shell-command
+    languages: [python]
+    severity: WARNING
+    message: Caller-controlled data reaches a shell command.
+    mode: taint
+    options: {taint_assume_safe_numbers: true, taint_assume_safe_booleans: true}
+    pattern-propagators: *comprehension
+    pattern-sources: *input
+    pattern-sanitizers:
+      - pattern: shlex.quote(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: subprocess.run($CMD, ..., shell=True, ...)
+              - pattern: subprocess.Popen($CMD, ..., shell=True, ...)
+              - pattern: subprocess.call($CMD, ..., shell=True, ...)
+              - pattern: subprocess.check_output($CMD, ..., shell=True, ...)
+              - pattern: subprocess.check_call($CMD, ..., shell=True, ...)
+              - pattern: subprocess.getoutput($CMD, ...)
+              - pattern: subprocess.getstatusoutput($CMD, ...)
+              - pattern: os.system($CMD, ...)
+              - pattern: os.popen($CMD, ...)
+          - focus-metavariable: $CMD
+  - id: mallace.python.yaml-load
+    languages: [python]
+    severity: WARNING
+    message: yaml.load without a safe loader can construct arbitrary objects.
+    patterns:
+      - pattern: yaml.load(...)
+      - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.load(..., Loader=yaml.CSafeLoader, ...)
+      - pattern-not: yaml.load(..., Loader=SafeLoader, ...)
+      - pattern-not: yaml.load(..., Loader=CSafeLoader, ...)
+  - id: mallace.python.pickle-load
+    languages: [python]
+    severity: WARNING
+    message: Pickle loading executes code from the serialized data.
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+  - id: mallace.python.sql-query-construction
+    languages: [python]
+    severity: WARNING
+    message: SQL query is built from caller-controlled data instead of bound parameters.
+    mode: taint
+    options: {taint_assume_safe_numbers: true, taint_assume_safe_booleans: true}
+    pattern-propagators: *comprehension
+    pattern-sources:
+      - label: INPUT
+        patterns:
+          - pattern-inside: |
+              def $FUNC(..., $PARAM, ...):
+                ...
+          - pattern: $PARAM
+          - metavariable-regex: {metavariable: $PARAM, regex: '^(?!(self|cls)$)'}
+      - label: INPUT
+        pattern-either:
+          - pattern: input(...)
+          - pattern: sys.argv
+          - pattern: os.environ[...]
+          - pattern: os.environ.get(...)
+          - pattern: os.getenv(...)
+          - pattern: request.$ATTR
+          - pattern: self.request.$ATTR
+      - label: INPUT
+        patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-inside: |
+                      class $HANDLER(..., $BASE, ...):
+                        ...
+                  - metavariable-regex: {metavariable: $BASE, regex: '(^|\.)(Base|SimpleHTTP|CGIHTTP)?(HTTP)?RequestHandler$|(^|\.)StreamRequestHandler$'}
+              # Written out with the module name (class H(http.server.BaseHTTPRequestHandler)).
+              - pattern-inside: |
+                  class $HANDLER(..., http.server.$CLS, ...):
+                    ...
+              - pattern-inside: |
+                  class $HANDLER(..., socketserver.StreamRequestHandler, ...):
+                    ...
+          - pattern-either:
+              - pattern: self.path
+              - pattern: self.headers
+              - pattern: self.rfile.$READ(...)
+              - pattern: self.requestline
+      - label: INPUT
+        patterns:
+          - pattern-inside: |
+              class $HANDLER(...):
+                ...
+                def $HELPER(self, ...):
+                  ...
+                  return <... self.rfile.$READ(...) ...>
+                ...
+          - pattern: self.$HELPER(...)
+      - label: BUILT
+        requires: INPUT
+        pattern-either:
+          - pattern: $LEFT + $RIGHT
+          - pattern: f"..."
+          - pattern: $TEMPLATE % $VALUES
+          - pattern: $TEMPLATE.format(...)
+    pattern-sinks:
+      - requires: BUILT
+        patterns:
+          - pattern-either:
+              - pattern: $DB.execute($QUERY, ...)
+              - pattern: $DB.executemany($QUERY, ...)
+              - pattern: $DB.executescript($QUERY, ...)
+          - focus-metavariable: $QUERY
+  # XSS and SSRF only follow web request data (not plain function arguments): a helper that takes a
+  # URL or HTML is normal code, a URL or markup taken straight from the request is the bug.
+  - id: mallace.python.reflected-xss
+    languages: [python]
+    severity: WARNING
+    message: Request data is returned as HTML without escaping (cross-site scripting).
+    mode: taint
+    options: {taint_assume_safe_numbers: true, taint_assume_safe_booleans: true}
+    pattern-propagators: *comprehension
+    pattern-sources: &web
+      - pattern-either:
+          - pattern: request.$ATTR
+          - pattern: self.request.$ATTR
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-inside: |
+                      class $HANDLER(..., $BASE, ...):
+                        ...
+                  - metavariable-regex: {metavariable: $BASE, regex: '(^|\.)(Base|SimpleHTTP|CGIHTTP)?(HTTP)?RequestHandler$|(^|\.)StreamRequestHandler$'}
+              # Written out with the module name (class H(http.server.BaseHTTPRequestHandler)).
+              - pattern-inside: |
+                  class $HANDLER(..., http.server.$CLS, ...):
+                    ...
+              - pattern-inside: |
+                  class $HANDLER(..., socketserver.StreamRequestHandler, ...):
+                    ...
+          - pattern-either:
+              - pattern: self.path
+              - pattern: self.headers
+              - pattern: self.rfile.$READ(...)
+              - pattern: self.requestline
+      # A handler's own helper that returns request data (e.g. a parsed form body).
+      - patterns:
+          - pattern-inside: |
+              class $HANDLER(...):
+                ...
+                def $HELPER(self, ...):
+                  ...
+                  return <... self.rfile.$READ(...) ...>
+                ...
+          - pattern: self.$HELPER(...)
+    pattern-sanitizers: &xss_clean
+      - pattern-either:
+          - pattern: html.escape(...)
+          - pattern: escape(...)
+          - pattern: markupsafe.escape(...)
+          - pattern: flask.escape(...)
+          - pattern: bleach.clean(...)
+          - pattern: json.dumps(...)
+          - pattern: jsonify(...)
+          - pattern: urllib.parse.quote(...)
+          - pattern: quote(...)
+          - pattern: int(...)
+          - pattern: float(...)
+          # File contents are reported as path traversal, not again as XSS.
+          - pattern: open(...)
+          - pattern: send_file(...)
+          - pattern: flask.send_file(...)
+          - pattern: send_from_directory(...)
+          - pattern: FileResponse(...)
+          # A fetched page is reported once, as SSRF, not again as XSS.
+          - pattern: requests.$VERB(...)
+          - pattern: httpx.$VERB(...)
+          - pattern: urlopen(...)
+    pattern-sinks: &xss_out
+      - patterns:
+          - pattern-either:
+              - pattern: HttpResponse($OUT, ...)
+              - pattern: make_response($OUT, ...)
+              - pattern: flask.make_response($OUT, ...)
+              - pattern: Markup($OUT)
+              - pattern: markupsafe.Markup($OUT)
+              - pattern: mark_safe($OUT)
+              - pattern: HTMLResponse($OUT, ...)
+              # http.server: the response body, written directly or through the handler's own helper.
+              - patterns:
+                  - pattern-inside: |
+                      class $HANDLER(...):
+                        ...
+                  - pattern: self.wfile.write($OUT)
+              - patterns:
+                  - pattern-inside: |
+                      class $HANDLER(...):
+                        ...
+                        def $HELPER(self, $BODY, ...):
+                          ...
+                          self.wfile.write(...)
+                        ...
+                  - pattern-not-inside: self.$HELPER($X, 'text/plain', ...)
+                  - pattern-not-inside: self.$HELPER($X, "text/plain", ...)
+                  # The body argument, or HTML built inside it (e.g. f-strings joined from rows).
+                  - pattern-either:
+                      - pattern: self.$HELPER($OUT, ...)
+                      - patterns:
+                          - pattern-inside: self.$HELPER(...)
+                          - pattern: $OUT
+                          - pattern: f"..."
+              - patterns:
+                  - pattern-inside: |
+                      @$APP.$ROUTE(...)
+                      def $VIEW(...):
+                        ...
+                  - metavariable-regex: {metavariable: $ROUTE, regex: '^(route|get|post|put|patch|delete)$'}
+                  - pattern-not-inside: return jsonify(...)
+                  - pattern-not-inside: return {...}
+                  - pattern-not-inside: return [...]
+                  - pattern-not-inside: return redirect(...)
+                  - pattern-not-inside: return render_template(...)
+                  # The returned body, or HTML built inside it (e.g. f-strings joined from rows).
+                  - pattern-either:
+                      - pattern: return $OUT
+                      - patterns:
+                          - pattern-inside: return ...
+                          - pattern: $OUT
+                          - pattern: f"..."
+          - focus-metavariable: $OUT
+  - id: mallace.python.ssrf
+    languages: [python]
+    severity: WARNING
+    message: The server fetches a URL taken from the request (server-side request forgery).
+    mode: taint
+    pattern-propagators: *comprehension
+    pattern-sources: *web
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: requests.$VERB($URL, ...)
+                      - pattern: httpx.$VERB($URL, ...)
+                  - metavariable-regex: {metavariable: $VERB, regex: '^(get|post|put|patch|delete|head|options|stream)$'}
+              - pattern: requests.request($METHOD, $URL, ...)
+              - pattern: httpx.request($METHOD, $URL, ...)
+              - pattern: urllib.request.urlopen($URL, ...)
+              - pattern: urlopen($URL, ...)
+              - patterns:
+                  - pattern: $CLIENT.$VERB($URL, ...)
+                  - metavariable-regex: {metavariable: $CLIENT, regex: '(?i)^(session|client|http|s|http_client|async_client)$'}
+                  - metavariable-regex: {metavariable: $VERB, regex: '^(get|post|put|patch|delete|head|request|stream)$'}
+          - focus-metavariable: $URL
+  # Stored XSS: a value read back from the database is sent as HTML without escaping.
+  - id: mallace.python.stored-xss
+    languages: [python]
+    severity: WARNING
+    message: A value read from the database is sent back as HTML without escaping (stored cross-site scripting).
+    mode: taint
+    options: {taint_assume_safe_numbers: true, taint_assume_safe_booleans: true}
+    pattern-sources:
+      - pattern-either:
+          - pattern: $DB.execute(...).fetchall()
+          - pattern: $DB.execute(...).fetchone()
+          - pattern: $DB.execute(...).fetchmany(...)
+          - pattern: $CURSOR.fetchall()
+          - pattern: $CURSOR.fetchone()
+          - pattern: $CURSOR.fetchmany(...)
+    pattern-sanitizers: *xss_clean
+    pattern-sinks: *xss_out
+  # File reads: a path taken from the request opens a file, so ../ can reach files outside the app.
+  - id: mallace.python.path-traversal
+    languages: [python]
+    severity: WARNING
+    message: A file path taken from the request is opened without confining it to a directory (path traversal).
+    mode: taint
+    pattern-propagators: *comprehension
+    pattern-sources: *web
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: os.path.basename(...)
+          - pattern: secure_filename(...)
+          - pattern: werkzeug.utils.secure_filename(...)
+          - pattern: int(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: open($PATH, ...)
+              - pattern: io.open($PATH, ...)
+              - pattern: send_file($PATH, ...)
+              - pattern: flask.send_file($PATH, ...)
+              - pattern: FileResponse($PATH, ...)
+              - pattern: pathlib.Path($PATH).$READ(...)
+              - pattern: Path($PATH).$READ(...)
+          - focus-metavariable: $PATH

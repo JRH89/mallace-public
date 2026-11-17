@@ -1,0 +1,277 @@
+# JavaScript/TypeScript taint rules: caller-controlled data (function parameters, Express-style
+# request fields, argv, environment) must reach the sink. Constant-only code is not reported.
+rules:
+  - id: mallace.javascript.command-injection
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Caller-controlled data reaches a shell command.
+    mode: taint
+    pattern-sources: &input
+      - patterns:
+          - pattern-either:
+              - pattern-inside: function $FUNC(..., $PARAM, ...) { ... }
+              - pattern-inside: (..., $PARAM, ...) => { ... }
+              - pattern-inside: (..., $PARAM, ...) => $BODY
+              - pattern-inside: $METHOD(..., $PARAM, ...) { ... }
+          - pattern: $PARAM
+      - pattern-either:
+          - pattern: $REQ.query
+          - pattern: $REQ.body
+          - pattern: $REQ.params
+          - pattern: $REQ.headers
+          - pattern: $REQ.cookies
+          - pattern: process.argv
+          - pattern: process.env
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $CP.exec($CMD, ...)
+              - pattern: $CP.execSync($CMD, ...)
+              - pattern: exec($CMD, ...)
+              - pattern: execSync($CMD, ...)
+              - pattern: '$CP.spawn($CMD, $ARGS, {..., shell: true, ...})'
+              - pattern: 'spawn($CMD, $ARGS, {..., shell: true, ...})'
+              - pattern: '$CP.spawnSync($CMD, $ARGS, {..., shell: true, ...})'
+              - pattern: 'spawnSync($CMD, $ARGS, {..., shell: true, ...})'
+          - pattern-not: /.../.exec(...)
+          - focus-metavariable: $CMD
+  - id: mallace.javascript.dynamic-eval
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Caller-controlled data reaches dynamic code evaluation.
+    mode: taint
+    pattern-sources: *input
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: eval($CODE)
+              - pattern: new Function(..., $CODE)
+              - pattern: Function(..., $CODE)
+              - pattern: $VM.runInNewContext($CODE, ...)
+              - pattern: $VM.runInThisContext($CODE, ...)
+              - pattern: $VM.runInContext($CODE, ...)
+              - pattern: setTimeout($CODE, ...)
+          - focus-metavariable: $CODE
+  - id: mallace.javascript.sql-query-construction
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: SQL query is built from caller-controlled data instead of bound parameters.
+    mode: taint
+    pattern-sources:
+      - label: INPUT
+        patterns:
+          - pattern-either:
+              - pattern-inside: function $FUNC(..., $PARAM, ...) { ... }
+              - pattern-inside: (..., $PARAM, ...) => { ... }
+              - pattern-inside: (..., $PARAM, ...) => $BODY
+              - pattern-inside: $METHOD(..., $PARAM, ...) { ... }
+          - pattern: $PARAM
+      - label: INPUT
+        pattern-either:
+          - pattern: $REQ.query
+          - pattern: $REQ.body
+          - pattern: $REQ.params
+          - pattern: $REQ.headers
+          - pattern: process.argv
+          - pattern: process.env
+      - label: BUILT
+        requires: INPUT
+        pattern-either:
+          - pattern: $LEFT + $RIGHT
+          - pattern: "`...${$X}...`"
+          - pattern: $LEFT.concat(...)
+    pattern-sinks:
+      - requires: BUILT
+        patterns:
+          - pattern-either:
+              - pattern: $DB.query($QUERY, ...)
+              - pattern: $DB.execute($QUERY, ...)
+              # get/run/all are also HTTP-client and Map methods, so the receiver must look like a database.
+              - patterns:
+                  - pattern-either:
+                      - pattern: $DB.run($QUERY, ...)
+                      - pattern: $DB.all($QUERY, ...)
+                      - pattern: $DB.get($QUERY, ...)
+                  - metavariable-regex:
+                      metavariable: $DB
+                      regex: (?i).*(db|database|sqlite|sql|conn|connection|pool|stmt|statement|knex|sequelize|models)$
+              - pattern: $DB.prepare($QUERY, ...)
+              - pattern: $DB.raw($QUERY, ...)
+              - pattern: $DB.$queryRawUnsafe($QUERY, ...)
+              - pattern: $DB.$executeRawUnsafe($QUERY, ...)
+          - focus-metavariable: $QUERY
+  # MongoDB: input inside a $where JavaScript string, or a request value used as a whole query field (an
+  # attacker sends {"$ne": null} as JSON and the filter matches everything, e.g. a login without a password).
+  - id: mallace.javascript.nosql-injection
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Caller-controlled data changes a MongoDB query (NoSQL injection).
+    mode: taint
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: function $FUNC(..., $PARAM, ...) { ... }
+              - pattern-inside: (..., $PARAM, ...) => { ... }
+              - pattern-inside: $METHOD(..., $PARAM, ...) { ... }
+          - pattern: $PARAM
+      - pattern-either:
+          - pattern: $REQ.query
+          - pattern: $REQ.body
+          - pattern: $REQ.params
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: parseInt(...)
+          - pattern: parseFloat(...)
+          - pattern: Number(...)
+          - pattern: String(...)
+          - pattern: $X.toString()
+          - pattern: mongoSanitize(...)
+          - pattern: sanitize(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: "{..., $where: $CODE, ...}"
+              - pattern: "{..., '$where': $CODE, ...}"
+              - pattern: "{..., \"$where\": $CODE, ...}"
+          - focus-metavariable: $CODE
+      - patterns:
+          - pattern-either:
+              - pattern: "$COLL.$OP({..., $KEY: $VALUE, ...}, ...)"
+          # SQL ORMs (Sequelize, Prisma, TypeORM) take { where: {...} } and always bind values as data.
+          - pattern-not: "$COLL.$OP({..., where: $W, ...}, ...)"
+          - metavariable-regex:
+              metavariable: $OP
+              regex: ^(find|findOne|findOneAndUpdate|findOneAndDelete|findOneAndReplace|updateOne|updateMany|deleteOne|deleteMany|countDocuments|count|exists)$
+          - metavariable-pattern:
+              metavariable: $VALUE
+              patterns:
+                - pattern-either:
+                    - pattern: $R.body.$F
+                    - pattern: $R.query.$F
+                    - pattern: $R.body[$F]
+                    - pattern: $R.query[$F]
+          - focus-metavariable: $VALUE
+  # XSS and SSRF only follow web request data (not plain function parameters).
+  - id: mallace.javascript.reflected-xss
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Request data is sent back as HTML without escaping (cross-site scripting).
+    mode: taint
+    pattern-sources: &web
+      - pattern-either:
+          - pattern: $REQ.query
+          - pattern: $REQ.body
+          - pattern: $REQ.params
+          - pattern: $REQ.headers
+          - pattern: $REQ.cookies
+    pattern-sanitizers: &xss_clean
+      - pattern-either:
+          - pattern: escapeHtml(...)
+          - pattern: escape(...)
+          - pattern: $LIB.escape(...)
+          - pattern: he.encode(...)
+          - pattern: DOMPurify.sanitize(...)
+          - pattern: sanitizeHtml(...)
+          - pattern: encodeURIComponent(...)
+          - pattern: JSON.stringify(...)
+          - pattern: Number(...)
+          - pattern: parseInt(...)
+          # Already reported as code injection or SSRF; not reported again as XSS.
+          - pattern: eval(...)
+          - pattern: fetch(...)
+          - pattern: axios.$VERB(...)
+          # File contents are reported as path traversal, not again as XSS.
+          - pattern: fs.$READ(...)
+          - pattern: readFileSync(...)
+          - pattern: readFile(...)
+          # Rows mapped through an escaper.
+          - patterns:
+              - pattern: $ROWS.map($FN)
+              - metavariable-pattern:
+                  metavariable: $FN
+                  pattern-either:
+                    - pattern: escapeHtml(...)
+                    - pattern: escape(...)
+                    - pattern: $LIB.escape(...)
+                    - pattern: he.encode(...)
+                    - pattern: DOMPurify.sanitize(...)
+                    - pattern: sanitizeHtml(...)
+    pattern-sinks: &xss_out
+      - patterns:
+          - pattern-either:
+              - pattern: $RES.send($OUT)
+              - pattern: $RES.write($OUT, ...)
+              - pattern: $RES.end($OUT, ...)
+              - pattern: $RES.status($CODE).send($OUT)
+          - metavariable-regex: {metavariable: $RES, regex: '^(res|response|reply|ctx\.res)$'}
+          - focus-metavariable: $OUT
+  - id: mallace.javascript.ssrf
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: The server fetches a URL taken from the request (server-side request forgery).
+    mode: taint
+    pattern-sources: *web
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: fetch($URL, ...)
+              - pattern: axios($URL, ...)
+              - pattern: got($URL, ...)
+              - pattern: needle($M, $URL, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern: axios.$VERB($URL, ...)
+                      - pattern: got.$VERB($URL, ...)
+                      - pattern: superagent.$VERB($URL, ...)
+                      - pattern: needle.$VERB($URL, ...)
+                  - metavariable-regex: {metavariable: $VERB, regex: '^(get|post|put|patch|delete|head|request)$'}
+              - patterns:
+                  - pattern-either:
+                      - pattern: http.get($URL, ...)
+                      - pattern: https.get($URL, ...)
+                      - pattern: http.request($URL, ...)
+                      - pattern: https.request($URL, ...)
+          - focus-metavariable: $URL
+  # Stored XSS: rows read back from the database are sent as HTML without escaping.
+  - id: mallace.javascript.stored-xss
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: A value read from the database is sent back as HTML without escaping (stored cross-site scripting).
+    mode: taint
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: await $DB.$QUERY(...)
+              - pattern: $DB.$QUERY(...).all(...)
+              - pattern: $DB.$QUERY(...).get(...)
+          - metavariable-regex: {metavariable: $QUERY, regex: '^(all|get|query|execute|prepare|find|findOne|findMany|findAll|findUnique)$'}
+    pattern-sanitizers: *xss_clean
+    pattern-sinks: *xss_out
+  # File reads: a path taken from the request opens a file, so ../ can reach files outside the app.
+  - id: mallace.javascript.path-traversal
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: A file path taken from the request is opened without confining it to a directory (path traversal).
+    mode: taint
+    pattern-sources: *web
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: path.basename(...)
+          - pattern: basename(...)
+          - pattern: Number(...)
+          - pattern: parseInt(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: fs.$READ($PATH, ...)
+                      - pattern: fsp.$READ($PATH, ...)
+                      - pattern: fs.promises.$READ($PATH, ...)
+                      - pattern: $READ($PATH, ...)
+                  - metavariable-regex: {metavariable: $READ, regex: '^(readFile|readFileSync|createReadStream|open|openSync)$'}
+              - pattern: $RES.download($PATH, ...)
+              - patterns:
+                  - pattern: $RES.sendFile($PATH, ...)
+                  - pattern-not: '$RES.sendFile($PATH, {..., root: $ROOT, ...}, ...)'
+          - focus-metavariable: $PATH

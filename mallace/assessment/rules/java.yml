@@ -1,0 +1,192 @@
+# Java taint rules: caller-controlled data (method parameters, servlet and Spring request data,
+# command-line args, environment) must reach the sink. Constant-only queries and commands are not reported.
+rules:
+  - id: mallace.java.command-injection
+    languages: [java]
+    severity: WARNING
+    message: Caller-controlled data reaches a shell command.
+    mode: taint
+    pattern-sources: &input
+      - patterns:
+          - pattern-inside: |
+              $RET $METHOD(..., $TYPE $PARAM, ...) { ... }
+          - pattern: $PARAM
+      - pattern-either:
+          - pattern: (HttpServletRequest $REQ).getParameter(...)
+          - pattern: (HttpServletRequest $REQ).getHeader(...)
+          - pattern: (HttpServletRequest $REQ).getQueryString()
+          - pattern: (HttpServletRequest $REQ).getCookies()
+          - pattern: System.getenv(...)
+          - pattern: System.getProperty(...)
+    pattern-sanitizers:
+      - pattern: Integer.parseInt(...)
+      - pattern: Long.parseLong(...)
+      - pattern: Integer.valueOf(...)
+      - pattern: Long.valueOf(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: Runtime.getRuntime().exec($CMD)
+              - pattern: Runtime.getRuntime().exec($CMD, ...)
+              - pattern: (Runtime $RT).exec($CMD, ...)
+              - pattern: new ProcessBuilder("sh", "-c", $CMD)
+              - pattern: new ProcessBuilder("bash", "-c", $CMD)
+              - pattern: new ProcessBuilder("/bin/sh", "-c", $CMD)
+              - pattern: new ProcessBuilder("cmd", "/c", $CMD)
+              - pattern: (ProcessBuilder $PB).command("sh", "-c", $CMD)
+              - pattern: (ProcessBuilder $PB).command("bash", "-c", $CMD)
+          - focus-metavariable: $CMD
+  - id: mallace.java.unsafe-deserialization
+    languages: [java]
+    severity: WARNING
+    message: Caller-controlled data is deserialized, which can create arbitrary objects and run their code.
+    mode: taint
+    pattern-sources: *input
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: new ObjectInputStream($DATA)
+              - pattern: new java.io.ObjectInputStream($DATA)
+              - pattern: new XMLDecoder($DATA, ...)
+              - pattern: new Yaml().load($DATA)
+              - pattern: (Yaml $Y).load($DATA)
+              - pattern: (XStream $X).fromXML($DATA)
+          - focus-metavariable: $DATA
+  - id: mallace.java.sql-query-construction
+    languages: [java]
+    severity: WARNING
+    message: SQL query is built from caller-controlled data instead of bound parameters.
+    mode: taint
+    pattern-sources:
+      - label: INPUT
+        patterns:
+          - pattern-inside: |
+              $RET $METHOD(..., $TYPE $PARAM, ...) { ... }
+          - pattern: $PARAM
+      - label: INPUT
+        pattern-either:
+          - pattern: (HttpServletRequest $REQ).getParameter(...)
+          - pattern: (HttpServletRequest $REQ).getHeader(...)
+          - pattern: System.getenv(...)
+      - label: BUILT
+        requires: INPUT
+        pattern-either:
+          - pattern: $LEFT + $RIGHT
+          - pattern: String.format(...)
+          - pattern: $S.formatted(...)
+          - pattern: String.join(...)
+          - pattern: (StringBuilder $SB).append(...).toString()
+          - pattern: $SB.toString()
+    pattern-sanitizers:
+      - pattern: Integer.parseInt(...)
+      - pattern: Long.parseLong(...)
+      - pattern: Integer.valueOf(...)
+      - pattern: Long.valueOf(...)
+    pattern-sinks:
+      - requires: BUILT
+        patterns:
+          - pattern-either:
+              - pattern: (Statement $ST).executeQuery($QUERY)
+              - pattern: (Statement $ST).execute($QUERY, ...)
+              - pattern: (Statement $ST).executeUpdate($QUERY, ...)
+              - pattern: (Statement $ST).addBatch($QUERY)
+              - pattern: $ST.executeQuery($QUERY)
+              - pattern: $ST.executeUpdate($QUERY)
+              - pattern: $CONN.prepareStatement($QUERY, ...)
+              - pattern: $CONN.prepareCall($QUERY, ...)
+              - pattern: $CONN.nativeSQL($QUERY)
+              - pattern: $EM.createQuery($QUERY, ...)
+              - pattern: $EM.createNativeQuery($QUERY, ...)
+              - pattern: $JDBC.query($QUERY, ...)
+              - pattern: $JDBC.queryForObject($QUERY, ...)
+              - pattern: $JDBC.queryForList($QUERY, ...)
+              - pattern: $JDBC.queryForMap($QUERY, ...)
+              - pattern: $JDBC.update($QUERY, ...)
+              - pattern: $JDBC.execute($QUERY, ...)
+              - pattern: $JDBC.batchUpdate($QUERY, ...)
+          - focus-metavariable: $QUERY
+  # File paths follow web request data only (servlet getters, Spring request parameters), not every method
+  # parameter, so helpers that take a path are not reported.
+  - id: mallace.java.path-traversal
+    languages: [java]
+    severity: WARNING
+    message: A file path from the request is opened as is, so an attacker could read files outside the intended folder.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: (HttpServletRequest $REQ).getParameter(...)
+          - pattern: (HttpServletRequest $REQ).getHeader(...)
+          - pattern: (HttpServletRequest $REQ).getPathInfo()
+          - pattern: (HttpServletRequest $REQ).getQueryString()
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $RET $METHOD(..., @RequestParam $TYPE $PARAM, ...) { ... }
+              - pattern-inside: |
+                  $RET $METHOD(..., @RequestParam(...) $TYPE $PARAM, ...) { ... }
+              - pattern-inside: |
+                  $RET $METHOD(..., @PathVariable $TYPE $PARAM, ...) { ... }
+              - pattern-inside: |
+                  $RET $METHOD(..., @PathVariable(...) $TYPE $PARAM, ...) { ... }
+              - pattern-inside: |
+                  $RET $METHOD(..., @RequestHeader(...) $TYPE $PARAM, ...) { ... }
+          - pattern: $PARAM
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: $P.getFileName()
+          - pattern: (File $F).getName()
+          - pattern: new File(...).getName()
+          - pattern: FilenameUtils.getName(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: new File($PATH)
+              - pattern: new File($BASE, $PATH)
+              - pattern: new FileInputStream($PATH)
+              - pattern: new FileReader($PATH)
+              - pattern: Paths.get(..., $PATH, ...)
+              - pattern: Path.of(..., $PATH, ...)
+              - pattern: (Path $DIR).resolve($PATH)
+              - pattern: Files.readAllBytes($PATH)
+              - pattern: Files.readString($PATH, ...)
+              - pattern: Files.readAllLines($PATH, ...)
+              - pattern: Files.newInputStream($PATH, ...)
+              - pattern: Files.newBufferedReader($PATH, ...)
+              - pattern: Files.lines($PATH, ...)
+          # Only the last name is kept: Paths.get(name).getFileName(), new File(name).getName().
+          - pattern-not-inside: Paths.get(...).getFileName()
+          - pattern-not-inside: Path.of(...).getFileName()
+          - pattern-not-inside: new File(...).getName()
+          - focus-metavariable: $PATH
+  # Request data written into an HTML response without escaping.
+  - id: mallace.java.reflected-xss
+    languages: [java]
+    severity: WARNING
+    message: Request data is written into the HTML response without escaping, so an attacker's script could run in a visitor's browser.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: (HttpServletRequest $REQ).getParameter(...)
+          - pattern: (HttpServletRequest $REQ).getHeader(...)
+          - pattern: (HttpServletRequest $REQ).getQueryString()
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: $ANY.htmlEscape(...)
+          - pattern: $ANY.escapeHtml4(...)
+          - pattern: $ANY.forHtml(...)
+          - pattern: HtmlUtils.htmlEscape(...)
+          - pattern: StringEscapeUtils.escapeHtml4(...)
+          - pattern: Encode.forHtml(...)
+          - pattern: Integer.parseInt(...)
+          - pattern: Long.parseLong(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: (HttpServletResponse $RES).getWriter().$W($OUT)
+              - pattern: (PrintWriter $PW).$W($OUT)
+          - metavariable-regex:
+              metavariable: $W
+              regex: ^(print|println|write|append|printf|format)$
+          - pattern-not: System.out.$W(...)
+          - pattern-not: System.err.$W(...)
+          - focus-metavariable: $OUT

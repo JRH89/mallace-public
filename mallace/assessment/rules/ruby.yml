@@ -1,0 +1,273 @@
+# Ruby taint rules: caller-controlled data (method parameters, Rails/Rack request data, ARGV,
+# environment, stdin) must reach the sink. Constant-only queries and commands are not reported.
+rules:
+  - id: mallace.ruby.command-injection
+    languages: [ruby]
+    severity: WARNING
+    message: Caller-controlled data reaches a shell command.
+    mode: taint
+    pattern-sources: &input
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  def $FUNC(..., $PARAM, ...)
+                    ...
+                  end
+              - pattern-inside: |
+                  def self.$FUNC(..., $PARAM, ...)
+                    ...
+                  end
+          - pattern: $PARAM
+      - pattern-either:
+          - pattern: params
+          - pattern: cookies
+          - pattern: request.$ATTR
+          - pattern: ARGV
+          - pattern: ENV
+          - pattern: gets
+          - pattern: STDIN.$READ
+          - pattern: $stdin.$READ
+    pattern-sanitizers:
+      - pattern: Shellwords.escape(...)
+      - pattern: Shellwords.shellescape(...)
+      - pattern: $X.shellescape
+      - pattern: $X.to_i
+      - pattern: Integer(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: system($CMD)
+              - pattern: Kernel.system($CMD)
+              - pattern: exec($CMD)
+              - pattern: Kernel.exec($CMD)
+              - pattern: spawn($CMD)
+              - pattern: Process.spawn($CMD)
+              - pattern: IO.popen($CMD, ...)
+              - pattern: Open3.capture2($CMD)
+              - pattern: Open3.capture2e($CMD)
+              - pattern: Open3.capture3($CMD)
+              - pattern: Open3.popen2($CMD)
+              - pattern: Open3.popen2e($CMD)
+              - pattern: Open3.popen3($CMD)
+              - pattern: Open3.pipeline($CMD)
+              - pattern: '`...#{$CMD}...`'
+              - pattern: '%x(...#{$CMD}...)'
+          - focus-metavariable: $CMD
+  - id: mallace.ruby.dynamic-eval
+    languages: [ruby]
+    severity: WARNING
+    message: Caller-controlled data reaches dynamic code evaluation.
+    mode: taint
+    pattern-sources: *input
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: eval($CODE, ...)
+              - pattern: Kernel.eval($CODE, ...)
+              - pattern: instance_eval($CODE, ...)
+              - pattern: class_eval($CODE, ...)
+              - pattern: module_eval($CODE, ...)
+              - pattern: $OBJ.instance_eval($CODE, ...)
+              - pattern: $OBJ.class_eval($CODE, ...)
+              - pattern: $OBJ.module_eval($CODE, ...)
+              - pattern: binding.eval($CODE, ...)
+          - focus-metavariable: $CODE
+  - id: mallace.ruby.unsafe-deserialization
+    languages: [ruby]
+    severity: WARNING
+    message: Caller-controlled data is deserialized, which can create arbitrary objects.
+    mode: taint
+    pattern-sources: *input
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: Marshal.load($DATA, ...)
+              - pattern: Marshal.restore($DATA, ...)
+              - pattern: YAML.load($DATA, ...)
+              - pattern: YAML.unsafe_load($DATA, ...)
+              - pattern: Psych.load($DATA, ...)
+              - pattern: Psych.unsafe_load($DATA, ...)
+              - pattern: Oj.load($DATA, ...)
+          - pattern-not: 'YAML.load($DATA, ..., permitted_classes: $P, ...)'
+          - pattern-not: 'Psych.load($DATA, ..., permitted_classes: $P, ...)'
+          - focus-metavariable: $DATA
+  - id: mallace.ruby.sql-query-construction
+    languages: [ruby]
+    severity: WARNING
+    message: SQL query is built from caller-controlled data instead of bound parameters.
+    mode: taint
+    pattern-sources:
+      - label: INPUT
+        patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  def $FUNC(..., $PARAM, ...)
+                    ...
+                  end
+              - pattern-inside: |
+                  def self.$FUNC(..., $PARAM, ...)
+                    ...
+                  end
+          - pattern: $PARAM
+      - label: INPUT
+        pattern-either:
+          - pattern: params
+          - pattern: cookies
+          - pattern: request.$ATTR
+          - pattern: ARGV
+          - pattern: ENV
+          - pattern: gets
+      - label: BUILT
+        requires: INPUT
+        pattern-either:
+          - pattern: $LEFT + $RIGHT
+          - pattern: '"...#{$X}..."'
+          - pattern: $TEMPLATE % $VALUES
+          - pattern: format(...)
+          - pattern: sprintf(...)
+    pattern-sanitizers:
+      - pattern: $X.to_i
+      - pattern: Integer(...)
+      - pattern: $DB.quote(...)
+      - pattern: $DB.escape(...)
+      - pattern: $DB.escape_string(...)
+      - pattern: sanitize_sql(...)
+      - pattern: sanitize_sql_array(...)
+      - pattern: sanitize_sql_like(...)
+      - pattern: $M.sanitize_sql(...)
+      - pattern: $M.sanitize_sql_array(...)
+    pattern-sinks:
+      - requires: BUILT
+        patterns:
+          - pattern-either:
+              - pattern: $DB.execute($QUERY, ...)
+              - pattern: $DB.exec($QUERY, ...)
+              - pattern: $DB.exec_query($QUERY, ...)
+              - pattern: $DB.exec_update($QUERY, ...)
+              - pattern: $DB.exec_delete($QUERY, ...)
+              - pattern: $DB.query($QUERY, ...)
+              - pattern: $DB.select_all($QUERY, ...)
+              - pattern: $DB.select_one($QUERY, ...)
+              - pattern: $DB.select_value($QUERY, ...)
+              - pattern: $DB.select_values($QUERY, ...)
+              - pattern: $DB.select_rows($QUERY, ...)
+              - pattern: $DB.find_by_sql($QUERY, ...)
+              - pattern: $DB.count_by_sql($QUERY, ...)
+              - pattern: $DB.where($QUERY)
+              - pattern: $DB.having($QUERY)
+              - pattern: $DB.order($QUERY)
+              - pattern: $DB.joins($QUERY)
+              - pattern: $DB.pluck($QUERY)
+              - pattern: $DB.run($QUERY, ...)
+              - pattern: $DB.fetch($QUERY)
+              - pattern: $DB[$QUERY]
+          - focus-metavariable: $QUERY
+  # XSS, stored XSS and file reads only follow web request data (not plain method parameters).
+  - id: mallace.ruby.reflected-xss
+    languages: [ruby]
+    severity: WARNING
+    message: Request data is sent back as HTML without escaping (cross-site scripting).
+    mode: taint
+    pattern-sources: &web
+      - pattern-either:
+          - pattern: params
+          - pattern: cookies
+          - pattern: request.$ATTR
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: ERB::Util.html_escape(...)
+          - pattern: ERB::Util.h(...)
+          - pattern: CGI.escapeHTML(...)
+          - pattern: Rack::Utils.escape_html(...)
+          - pattern: h(...)
+          - pattern: html_escape(...)
+          - pattern: sanitize(...)
+          - pattern: $X.to_i
+          - pattern: $X.to_json
+          - pattern: ERB::Util.url_encode(...)
+          - pattern: CGI.escape(...)
+          # Reported as path traversal, not again as XSS.
+          - pattern: File.read(...)
+          - pattern: IO.read(...)
+          - pattern: File.binread(...)
+          # A record looked up from the database is stored data (stored-xss), not reflected.
+          - patterns:
+              - pattern-either:
+                  - pattern: $MODEL.$FIND(...)
+                  - pattern: $DB.execute(...)
+                  - pattern: $DB.query(...)
+              - metavariable-regex: {metavariable: $FIND, regex: '^(find|find_by|find_by!|where|first|last|pluck|order|select|execute|query|exec_query)$'}
+    pattern-sinks: &xss_out
+      - patterns:
+          - pattern-either:
+              - pattern: $OUT.html_safe
+              - pattern: raw($OUT)
+              - pattern: 'render(..., html: $OUT, ...)'
+              - pattern: 'render(..., inline: $OUT, ...)'
+              - pattern: 'render html: $OUT'
+              - pattern: 'render inline: $OUT'
+              # Sinatra: the route block's returned string is the response body.
+              - patterns:
+                  - pattern-inside: |
+                      $VERB $ROUTE do
+                        ...
+                      end
+                  - metavariable-regex: {metavariable: $VERB, regex: '^(get|post|put|patch|delete)$'}
+                  - pattern: '"...#{$OUT}..."'
+              - pattern: '[$STATUS, $HEADERS, [$OUT]]'
+          - focus-metavariable: $OUT
+  - id: mallace.ruby.stored-xss
+    languages: [ruby]
+    severity: WARNING
+    message: A value read from the database is sent back as HTML without escaping (stored cross-site scripting).
+    mode: taint
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $MODEL.$FIND(...)
+              - pattern: $MODEL.all
+              - pattern: $DB.execute(...)
+              - pattern: $DB.query(...)
+              - pattern: $DB[...]
+          - metavariable-regex: {metavariable: $FIND, regex: '^(find|find_by|find_by!|where|first|last|pluck|order|select|execute|query|exec_query)$'}
+    pattern-sanitizers: &xss_clean
+      - pattern-either:
+          - pattern: ERB::Util.html_escape(...)
+          - pattern: ERB::Util.h(...)
+          - pattern: CGI.escapeHTML(...)
+          - pattern: Rack::Utils.escape_html(...)
+          - pattern: h(...)
+          - pattern: html_escape(...)
+          - pattern: sanitize(...)
+          - pattern: $X.to_i
+          - pattern: $X.to_json
+          - pattern: ERB::Util.url_encode(...)
+          - pattern: CGI.escape(...)
+          # Reported as path traversal, not again as XSS.
+          - pattern: File.read(...)
+          - pattern: IO.read(...)
+          - pattern: File.binread(...)
+    pattern-sinks: *xss_out
+  - id: mallace.ruby.path-traversal
+    languages: [ruby]
+    severity: WARNING
+    message: A file path taken from the request is opened without confining it to a directory (path traversal).
+    mode: taint
+    pattern-sources: *web
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: File.basename(...)
+          - pattern: $X.to_i
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: File.read($PATH, ...)
+              - pattern: File.binread($PATH, ...)
+              - pattern: File.open($PATH, ...)
+              - pattern: File.readlines($PATH, ...)
+              - pattern: IO.read($PATH, ...)
+              - pattern: IO.readlines($PATH, ...)
+              - pattern: send_file($PATH, ...)
+              - pattern: Pathname.new($PATH).read
+              - pattern: Pathname($PATH).read
+          - focus-metavariable: $PATH
